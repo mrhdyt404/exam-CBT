@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # 1. PostgreSQL 16
+  postgres:
+    image: postgres:16-alpine
+    container_name: cbt_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: cbt_db
+      POSTGRES_USER: cbt_user
+      POSTGRES_PASSWORD: cbt_pass
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data/pgdata
+      - ./backend/scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cbt_user -d cbt_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Redis 7
+  redis:
+    image: redis:7-alpine
+    container_name: cbt_redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 3. Go API Server (Scaleable)
+  api-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.server
+    container_name: cbt_api_server
+    restart: always
+    environment:
+      APP_PORT: 8080
+      APP_ENV: production
+      POSTGRES_URL: postgres://cbt_user:cbt_pass@postgres:5432/cbt_db?sslmode=disable
+      POSTGRES_MAX_CONNS: 100
+      POSTGRES_MIN_CONNS: 10
+      REDIS_URL: redis:6379
+      REDIS_POOL_SIZE: 300
+      JWT_SECRET: super-cbt-secret-key-high-concurrency-2026
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 4. Asynchronous Write-Behind Worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: cbt_worker
+    restart: always
+    environment:
+      POSTGRES_URL: postgres://cbt_user:cbt_pass@postgres:5432/cbt_db?sslmode=disable
+      REDIS_URL: redis:6379
+      WORKER_BATCH_SIZE: 500
+      WORKER_FLUSH_INTERVAL_MS: 1500
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 5. Next.js Frontend App
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cbt_frontend
+    restart: always
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: http://api-server:8080/api/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-server
+
+  # 6. NGINX Load Balancer & Ingress Gateway
+  nginx:
+    image: nginx:alpine
+    container_name: cbt_nginx_lb
+    restart: always
+    volumes:
+      - ./deploy/nginx/cbt.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - api-server
+
+volumes:
+  pgdata:
+  redisdata:
